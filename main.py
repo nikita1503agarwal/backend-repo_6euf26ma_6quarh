@@ -190,6 +190,7 @@ class LoginInput(BaseModel):
     name: str
     phone: str
     role: str  # farmer | worker | buyer
+    password: Optional[str] = None  # accepting password instead of any PIN code
     language: Optional[str] = None
     location: Optional[GeoPoint] = None
 
@@ -199,6 +200,7 @@ def login(payload: LoginInput):
     if payload.role not in {"farmer", "worker", "buyer"}:
         raise HTTPException(status_code=400, detail="Invalid role")
 
+    # Note: For demo purposes, password is accepted but not validated against a store
     user = AppUser(
         name=payload.name,
         phone=payload.phone,
