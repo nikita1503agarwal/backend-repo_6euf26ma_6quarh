@@ -1,5 +1,6 @@
 import os
 import math
+import asyncio
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
@@ -22,6 +23,7 @@ from schemas import (
     SyncEvent,
     GeoPoint,
 )
+from services import translate_text, asr_transcribe
 
 app = FastAPI(title="KrishiSetu Backend API")
 
@@ -72,8 +74,11 @@ def detect_language(text: str) -> str:
 
 
 def simple_translate_to_en(text: str, lang: str) -> str:
-    # Placeholder translation. In production, integrate a translation API.
-    return text
+    # Use services-backed translator if available, else fallback
+    try:
+        return translate_text(text, target_lang="en", source_lang=lang)
+    except Exception:
+        return text
 
 
 def parse_int_in_text(text: str) -> Optional[int]:
@@ -218,9 +223,9 @@ class ASRInput(BaseModel):
 
 @app.post("/asr/transcribe")
 def transcribe(input: ASRInput):
-    # Placeholder ASR; integrate with a real ASR service in production
-    detected_lang = input.language or "en"
-    text = "Transcription unavailable in demo. Please use text input."
+    # Use services-backed ASR when available
+    text = asr_transcribe(input.audio_b64, input.language)
+    detected_lang = input.language or ("en" if text else "en")
     return {"language": detected_lang, "text": text}
 
 
@@ -268,14 +273,16 @@ def create_job(inp: CreateJobInput):
     return {"job_id": job_id, "matches": matches}
 
 
-def match_job(job_id: str) -> List[Dict[str, Any]]:
-    job_doc = db["farmerjob"].find_one({"_id": {'$eq': db["farmerjob"]._Database__client.codec_options.document_class().from_oid(job_id) if False else None}})
-    # Fallback: fetch by string then re-fetch by _id conversion manually
+def _get_obj_id(id_str: str):
     from bson import ObjectId
     try:
-        job_doc = db["farmerjob"].find_one({"_id": ObjectId(job_id)})
+        return ObjectId(id_str)
     except Exception:
-        job_doc = db["farmerjob"].find_one({"_id": job_id})
+        return id_str
+
+
+def match_job(job_id: str) -> List[Dict[str, Any]]:
+    job_doc = db["farmerjob"].find_one({"_id": _get_obj_id(job_id)})
     if not job_doc:
         return []
 
@@ -333,11 +340,7 @@ class ConfirmAssignmentInput(BaseModel):
 
 @app.post("/jobs/confirm")
 def confirm_assignment(inp: ConfirmAssignmentInput):
-    from bson import ObjectId
-    try:
-        job = db["farmerjob"].find_one({"_id": ObjectId(inp.job_id)})
-    except Exception:
-        job = db["farmerjob"].find_one({"_id": inp.job_id})
+    job = db["farmerjob"].find_one({"_id": _get_obj_id(inp.job_id)})
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
@@ -556,11 +559,7 @@ def sync_pull(user_id: str):
 # Convenience endpoints
 @app.get("/jobs/{job_id}")
 def get_job(job_id: str):
-    from bson import ObjectId
-    try:
-        doc = db["farmerjob"].find_one({"_id": ObjectId(job_id)})
-    except Exception:
-        doc = db["farmerjob"].find_one({"_id": job_id})
+    doc = db["farmerjob"].find_one({"_id": _get_obj_id(job_id)})
     if not doc:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"job": serialize_doc(doc)}
@@ -575,6 +574,45 @@ def list_jobs(farmer_id: Optional[str] = None, status: Optional[str] = None):
         q["status"] = status
     items = [serialize_doc(x) for x in db["farmerjob"].find(q).sort("created_at", -1)]
     return {"jobs": items}
+
+
+# -----------------------
+# 7. Background tasks: hourly market refresh + price alerts
+# -----------------------
+
+async def hourly_market_job():
+    # simple loop with 1h interval, runs forever
+    await asyncio.sleep(2)
+    while True:
+        try:
+            market_refresh()
+            # Create simple price alerts for a few commodities/regions
+            for commodity in ["ragi", "tomato", "paddy", "chilli"]:
+                for region in ["KA", "TN", "MH"]:
+                    fc = market_forecast(commodity, region, 10)
+                    if fc.trend == "up":
+                        n = Notification(
+                            user_id="all",
+                            type="price_alert",
+                            title=f"{commodity.title()} rising in {region}",
+                            body=f"Trend {fc.trend}. Consider selling in coming days.",
+                            data={"commodity": commodity, "region": region},
+                        )
+                        try:
+                            create_document("notification", n)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        await asyncio.sleep(60 * 60)  # 1 hour
+
+
+@app.on_event("startup")
+async def startup_event():
+    try:
+        asyncio.create_task(hourly_market_job())
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
